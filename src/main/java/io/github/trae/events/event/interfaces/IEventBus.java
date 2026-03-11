@@ -1,7 +1,8 @@
-package io.github.trae.events.interfaces;
+package io.github.trae.events.event.interfaces;
 
 import io.github.trae.events.event.Event;
 import io.github.trae.events.handler.HandlerList;
+import io.github.trae.events.interfaces.Listener;
 
 public interface IEventBus {
 

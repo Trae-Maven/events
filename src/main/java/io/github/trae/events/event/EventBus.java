@@ -2,11 +2,11 @@ package io.github.trae.events.event;
 
 import io.github.trae.events.annotations.AsynchronousEvent;
 import io.github.trae.events.annotations.EventHandler;
+import io.github.trae.events.event.interfaces.IEventBus;
 import io.github.trae.events.exceptions.EventException;
 import io.github.trae.events.handler.HandlerList;
 import io.github.trae.events.handler.RegisteredHandler;
 import io.github.trae.events.interfaces.Cancellable;
-import io.github.trae.events.interfaces.IEventBus;
 import io.github.trae.events.interfaces.Listener;
 
 import java.lang.reflect.Constructor;
