@@ -14,10 +14,11 @@ import lombok.Setter;
  * without manually implementing the {@link Cancellable} interface.</p>
  */
 @Getter
-@Setter
 public abstract class CancellableEvent extends Event implements Cancellable {
 
+    @Setter
     private boolean cancelled;
+
     private String cancelledReason;
 
     /**
