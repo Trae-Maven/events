@@ -16,7 +16,5 @@ public interface IEventBus {
 
     <T extends Event> T call(final T event);
 
-    boolean isAsynchronous(final Class<? extends Event> eventClass);
-
     void shutdown();
 }

@@ -2,6 +2,7 @@ package io.github.trae.events;
 
 import io.github.trae.events.event.Event;
 import io.github.trae.events.event.EventBus;
+import io.github.trae.events.event.types.impl.AsynchronousEvent;
 import io.github.trae.events.exceptions.EventException;
 import io.github.trae.events.interfaces.Cancellable;
 import io.github.trae.events.interfaces.Listener;
@@ -17,47 +18,58 @@ import java.util.concurrent.Executors;
  *
  * <p>Provides convenience access to a default {@link EventBus} instance without requiring
  * consumers to manage one directly. The backing {@link EventBus} and {@link ExecutorService}
- * are lazily initialized on first use.</p>
+ * are lazily and thread-safely initialized on first use.</p>
  *
- * <p>Synchronous methods ({@link #dispatchEvent}, {@link #supplyEvent}) enforce that the event is not
- * annotated with {@link io.github.trae.events.annotations.AsynchronousEvent}. Asynchronous
- * methods ({@link #dispatchAsynchronousEvent}, {@link #supplyAsynchronousEvent}) enforce that it is.</p>
+ * <p>Synchronous methods ({@link #dispatchEvent}, {@link #supplyEvent}) require that the event does
+ * not implement {@link AsynchronousEvent}. Asynchronous methods ({@link #dispatchAsynchronousEvent},
+ * {@link #supplyAsynchronousEvent}) require that it does, and submit the (synchronous) dispatch to
+ * the executor so completion can be awaited.</p>
  */
-public class EventApi {
+public final class EventApi {
 
-    private static EventBus eventBus;
+    private static volatile EventBus eventBus;
 
     @Getter
     @Setter
-    private static ExecutorService asynchronousExecutorService;
+    private static volatile ExecutorService asynchronousExecutorService;
+
+    private EventApi() {
+    }
 
     /**
      * Returns the backing {@link EventBus} instance, creating a default one if none exists.
      * Also initializes the async {@link ExecutorService} with a cached daemon thread pool
-     * if one has not been set.
+     * if one has not been set. Initialization is thread-safe.
      *
      * @return the event bus
      */
     public static EventBus getEventBus() {
-        if (getAsynchronousExecutorService() == null) {
-            setAsynchronousExecutorService(Executors.newCachedThreadPool(runnable -> {
-                final Thread thread = new Thread(runnable);
-                thread.setName("EventBus-Async-%s".formatted(thread.threadId()));
-                thread.setDaemon(true);
-                return thread;
-            }));
+        EventBus localBus = eventBus;
+        if (localBus == null) {
+            synchronized (EventApi.class) {
+                localBus = eventBus;
+                if (localBus == null) {
+                    if (asynchronousExecutorService == null) {
+                        asynchronousExecutorService = Executors.newCachedThreadPool(runnable -> {
+                            final Thread thread = new Thread(runnable);
+                            thread.setName("EventBus-Async-%s".formatted(thread.threadId()));
+                            thread.setDaemon(true);
+                            return thread;
+                        });
+                    }
+
+                    localBus = new EventBus(asynchronousExecutorService);
+                    eventBus = localBus;
+                }
+            }
         }
 
-        if (eventBus == null) {
-            eventBus = new EventBus(getAsynchronousExecutorService());
-        }
-
-        return eventBus;
+        return localBus;
     }
 
     /**
      * Dispatches the given event synchronously on the calling thread.
-     * Throws if the event is annotated with {@link io.github.trae.events.annotations.AsynchronousEvent}.
+     * Throws if the event implements {@link AsynchronousEvent}.
      *
      * @param event the event to fire
      * @param <T>   the event type
@@ -69,7 +81,7 @@ public class EventApi {
             throw new IllegalArgumentException("Event cannot be null.");
         }
 
-        if (getEventBus().isAsynchronous(event.getClass())) {
+        if (event instanceof AsynchronousEvent) {
             throw new EventException("Cannot dispatch asynchronous event synchronously.");
         }
 
@@ -77,8 +89,8 @@ public class EventApi {
     }
 
     /**
-     * Dispatches the given event asynchronously on a separate thread.
-     * Throws if the event is not annotated with {@link io.github.trae.events.annotations.AsynchronousEvent}.
+     * Dispatches the given event asynchronously on the bus executor (fire-and-forget).
+     * Throws if the event does not implement {@link AsynchronousEvent}.
      *
      * @param event the event to fire
      * @param <T>   the event type
@@ -90,16 +102,17 @@ public class EventApi {
             throw new IllegalArgumentException("Event cannot be null.");
         }
 
-        if (!(getEventBus().isAsynchronous(event.getClass()))) {
+        if (!(event instanceof AsynchronousEvent)) {
             throw new EventException("Cannot dispatch synchronous event asynchronously.");
         }
 
-        CompletableFuture.supplyAsync(() -> getEventBus().call(event));
+        final EventBus bus = getEventBus();
+        getAsynchronousExecutorService().execute(() -> bus.call(event));
     }
 
     /**
      * Dispatches the given event synchronously and returns the event instance.
-     * Throws if the event is annotated with {@link io.github.trae.events.annotations.AsynchronousEvent}.
+     * Throws if the event implements {@link AsynchronousEvent}.
      *
      * @param event the event to fire
      * @param <R>   the event type
@@ -112,7 +125,7 @@ public class EventApi {
             throw new IllegalArgumentException("Event cannot be null.");
         }
 
-        if (getEventBus().isAsynchronous(event.getClass())) {
+        if (event instanceof AsynchronousEvent) {
             throw new EventException("Cannot dispatch asynchronous event synchronously.");
         }
 
@@ -121,12 +134,13 @@ public class EventApi {
     }
 
     /**
-     * Dispatches the given event asynchronously and returns a future containing the event instance.
-     * Throws if the event is not annotated with {@link io.github.trae.events.annotations.AsynchronousEvent}.
+     * Dispatches the given event asynchronously on the bus executor and returns a future that
+     * completes with the event after all handlers have been invoked.
+     * Throws if the event does not implement {@link AsynchronousEvent}.
      *
      * @param event the event to fire
      * @param <R>   the event type
-     * @return a {@link CompletableFuture} that completes with the event after all handlers have been invoked
+     * @return a {@link CompletableFuture} that completes with the event once dispatch finishes
      * @throws IllegalArgumentException if the event is null
      * @throws EventException           if the event is not asynchronous
      */
@@ -135,11 +149,12 @@ public class EventApi {
             throw new IllegalArgumentException("Event cannot be null.");
         }
 
-        if (!(getEventBus().isAsynchronous(event.getClass()))) {
+        if (!(event instanceof AsynchronousEvent)) {
             throw new EventException("Cannot dispatch synchronous event asynchronously.");
         }
 
-        return CompletableFuture.supplyAsync(() -> getEventBus().call(event));
+        final EventBus bus = getEventBus();
+        return CompletableFuture.supplyAsync(() -> bus.call(event), getAsynchronousExecutorService());
     }
 
     /**
@@ -175,21 +190,6 @@ public class EventApi {
      */
     public static void unregisterAllListeners() {
         getEventBus().unregisterAll();
-    }
-
-    /**
-     * Checks whether the given event class is marked as asynchronous.
-     *
-     * @param eventClass the event class to check
-     * @return {@code true} if the event is asynchronous, {@code false} otherwise
-     * @throws IllegalArgumentException if the event class is null
-     */
-    public static boolean isAsynchronousEvent(final Class<? extends Event> eventClass) {
-        if (eventClass == null) {
-            throw new IllegalArgumentException("Event Class cannot be null.");
-        }
-
-        return getEventBus().isAsynchronous(eventClass);
     }
 
     /**

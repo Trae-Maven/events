@@ -1,6 +1,6 @@
 package io.github.trae.events.event.types;
 
-import io.github.trae.events.annotations.AsynchronousEvent;
+import io.github.trae.events.event.types.impl.AsynchronousEvent;
 
 /**
  * Convenience base class for asynchronous cancellable events.
@@ -10,6 +10,5 @@ import io.github.trae.events.annotations.AsynchronousEvent;
  * <p>Extend this instead of {@link CancellableEvent} when your cancellable event
  * should always be dispatched asynchronously.</p>
  */
-@AsynchronousEvent
-public abstract class CancellableAsyncEvent extends CancellableEvent {
+public abstract class CancellableAsyncEvent extends CancellableEvent implements AsynchronousEvent {
 }

@@ -1,6 +1,5 @@
 package io.github.trae.events.event;
 
-import io.github.trae.events.annotations.AsynchronousEvent;
 import io.github.trae.events.annotations.EventHandler;
 import io.github.trae.events.event.interfaces.IEventBus;
 import io.github.trae.events.exceptions.EventException;
@@ -9,12 +8,12 @@ import io.github.trae.events.handler.RegisteredHandler;
 import io.github.trae.events.interfaces.Cancellable;
 import io.github.trae.events.interfaces.Listener;
 
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -22,28 +21,45 @@ import java.util.logging.Logger;
  * Central event bus responsible for registering listeners and dispatching events.
  * Manages all {@link HandlerList} instances internally and supports hierarchical event dispatch.
  *
- * <p>Events annotated with {@link AsynchronousEvent} are automatically dispatched on a
- * separate thread pool. All other events are dispatched synchronously on the calling thread.</p>
+ * <p>{@link #call(Event)} dispatches synchronously on the calling thread and is the single
+ * dispatch primitive for the whole library. Asynchronous behaviour is owned by callers
+ * (for example {@link io.github.trae.events.EventApi}), which submit {@code call} to an
+ * executor — keeping {@code call} predictable and allowing completion to be awaited.</p>
  *
- * <h3>Hierarchy Dispatch:</h3>
- * <p>When a parent event is called, the bus automatically instantiates and dispatches
- * all registered child events using their no-arg constructors. When a child event is
- * called directly, handlers registered for every parent type in the hierarchy are also invoked.</p>
+ * <h3>Hierarchy dispatch</h3>
+ * <p>When an event is fired, handlers registered for its exact runtime type are invoked first,
+ * followed by handlers registered for each supertype up the chain (excluding {@link Event}
+ * itself), in priority order within each type. The resolved chain of {@link HandlerList}s for
+ * a given concrete event type is cached and reused; the cache is invalidated automatically
+ * whenever listeners are registered or unregistered.</p>
  */
 public final class EventBus implements IEventBus {
 
     private static final Logger LOGGER = Logger.getLogger(EventBus.class.getName());
 
     private final ConcurrentHashMap<Class<? extends Event>, HandlerList> handlerListMap = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Class<? extends Event>, Set<Class<? extends Event>>> childRegistryMap = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Class<? extends Event>, Constructor<? extends Event>> childConstructorMap = new ConcurrentHashMap<>();
+
+    /**
+     * Per-concrete-type cache of the ordered {@link HandlerList} chain to dispatch to.
+     * Each entry is tagged with the {@link #generation} it was built under; a stale entry
+     * (generation mismatch) is transparently rebuilt on the next dispatch.
+     */
+    private final ConcurrentHashMap<Class<? extends Event>, CachedDispatch> dispatchCache = new ConcurrentHashMap<>();
+
+    /**
+     * Monotonic registration generation. Incremented on every register/unregister so that
+     * cached dispatch chains built under an older generation are rebuilt on next use.
+     */
+    private final AtomicInteger generation = new AtomicInteger();
 
     private final ExecutorService asyncExecutor;
 
     /**
-     * Creates an event bus with a custom {@link ExecutorService} for async event dispatch.
+     * Creates an event bus with an associated executor. The executor is not used by
+     * {@link #call(Event)} directly; it is provided for callers that dispatch asynchronously
+     * and is shut down by {@link #shutdown()}.
      *
-     * @param asyncExecutor the executor to use for asynchronous events
+     * @param asyncExecutor the executor associated with this bus
      */
     public EventBus(final ExecutorService asyncExecutor) {
         this.asyncExecutor = asyncExecutor;
@@ -87,19 +103,23 @@ public final class EventBus implements IEventBus {
             method.trySetAccessible();
 
             this.handlerListMap.computeIfAbsent(eventClass, __ -> new HandlerList()).register(new RegisteredHandler(listener, method, annotation.priority(), annotation.ignoreCancelled()));
-
-            registerHierarchy(eventClass);
         }
+
+        this.generation.incrementAndGet();
     }
 
     /**
-     * Unregisters all handlers belonging to the given listener from all event types.
+     * Unregisters all handlers belonging to the given listener from all event types,
+     * pruning any event types left without handlers.
      */
     @Override
     public void unregister(final Listener listener) {
         for (final HandlerList handlerList : this.handlerListMap.values()) {
             handlerList.unregisterAll(listener);
         }
+
+        this.handlerListMap.values().removeIf(handlerList -> handlerList.size() == 0);
+        this.generation.incrementAndGet();
     }
 
     /**
@@ -109,20 +129,14 @@ public final class EventBus implements IEventBus {
     public void unregisterAll() {
         this.handlerListMap.values().forEach(HandlerList::clear);
         this.handlerListMap.clear();
-        this.childRegistryMap.clear();
-        this.childConstructorMap.clear();
+        this.dispatchCache.clear();
+        this.generation.incrementAndGet();
     }
 
     /**
-     * Dispatches the given event to all registered handlers in priority order.
-     *
-     * <p>If the event is annotated with {@link AsynchronousEvent}, dispatch happens
-     * on the async thread pool. Otherwise, dispatch happens synchronously on the
-     * calling thread.</p>
-     *
-     * <p>If the event has registered child types, each child is instantiated via its
-     * no-arg constructor and dispatched as well. When a child event is called directly,
-     * handlers for every parent type in the hierarchy are also invoked.</p>
+     * Dispatches the given event synchronously on the calling thread to all registered
+     * handlers, in supertype order (exact type first, then each parent up to but excluding
+     * {@link Event}) and priority order within each type.
      *
      * @param event the event to fire
      * @param <T>   the event type
@@ -130,27 +144,13 @@ public final class EventBus implements IEventBus {
      */
     @Override
     public <T extends Event> T call(final T event) {
-        if (isAsynchronous(event.getClass())) {
-            this.asyncExecutor.execute(() -> dispatchAll(event));
-        } else {
-            dispatchAll(event);
-        }
+        this.dispatchAll(event);
         return event;
     }
 
     /**
-     * Checks whether the given event class is marked as asynchronous
-     * via {@link AsynchronousEvent}. The annotation is {@link java.lang.annotation.Inherited},
-     * so child classes inherit it from annotated parents.
-     */
-    @Override
-    public boolean isAsynchronous(final Class<? extends Event> eventClass) {
-        return eventClass.isAnnotationPresent(AsynchronousEvent.class);
-    }
-
-    /**
-     * Shuts down the async executor. Should be called when the event bus is no longer needed
-     * to prevent thread leaks.
+     * Shuts down the associated executor. Should be called when the event bus is no longer
+     * needed to prevent thread leaks.
      */
     @Override
     public void shutdown() {
@@ -158,95 +158,66 @@ public final class EventBus implements IEventBus {
     }
 
     /**
-     * Performs the full dispatch cycle: exact type, parent hierarchy, and child events.
+     * Resolves (using the cache) and walks the handler chain for the event's runtime type,
+     * invoking each handler in order.
      */
-    private <T extends Event> void dispatchAll(final T event) {
+    private void dispatchAll(final Event event) {
         final Class<? extends Event> eventClass = event.getClass();
+        final int currentGeneration = this.generation.get();
 
-        // 1. Dispatch to handlers registered for the exact type
-        this.dispatch(event, eventClass);
-
-        // 2. Walk up the hierarchy and dispatch to parent handlers
-        Class<?> parentClass = eventClass.getSuperclass();
-        while (parentClass != null && Event.class.isAssignableFrom(parentClass) && parentClass != Event.class) {
-            this.dispatch(event, parentClass.asSubclass(Event.class));
-
-            parentClass = parentClass.getSuperclass();
+        CachedDispatch cached = this.dispatchCache.get(eventClass);
+        if (cached == null || cached.generation() != currentGeneration) {
+            cached = new CachedDispatch(currentGeneration, this.resolveChain(eventClass));
+            this.dispatchCache.put(eventClass, cached);
         }
 
-        // 3. Dispatch to child events (instantiated via no-arg constructor)
-        final Set<Class<? extends Event>> childrenSet = this.childRegistryMap.get(eventClass);
-        if (childrenSet != null) {
-            for (final Class<? extends Event> childClass : childrenSet) {
-                if (childClass == eventClass) {
-                    continue;
-                }
+        final HandlerList[] chain = cached.handlerLists();
+        if (chain.length == 0) {
+            return;
+        }
 
-                final Constructor<? extends Event> declaredConstructor = this.childConstructorMap.get(childClass);
-                if (declaredConstructor == null) {
+        final Cancellable cancellable = (event instanceof final Cancellable c) ? c : null;
+
+        for (final HandlerList handlerList : chain) {
+            for (final RegisteredHandler handler : handlerList.getBakedRegisteredHandlers()) {
+                if (cancellable != null && handler.isIgnoreCancelled() && cancellable.isCancelled()) {
                     continue;
                 }
 
                 try {
-                    this.call(declaredConstructor.newInstance());
-                } catch (final Exception e) {
-                    LOGGER.log(Level.SEVERE, "Failed to instantiate child event %s".formatted(childClass.getName()), e);
+                    handler.invoke(event);
+                } catch (final EventException e) {
+                    LOGGER.log(Level.SEVERE, "Error dispatching event %s to handler %s in %s".formatted(event.getEventName(), handler.getMethod().getName(), handler.getListener().getClass().getName()), e);
                 }
             }
         }
     }
 
     /**
-     * Dispatches handlers registered for a specific class against the given event instance.
+     * Builds the ordered {@link HandlerList} chain for a concrete event type: the exact type
+     * first, then each supertype up the hierarchy that has registered handlers, stopping
+     * before {@link Event} itself. Types without handlers are skipped.
      */
-    private void dispatch(final Event event, final Class<? extends Event> targetClass) {
-        final HandlerList handlerList = this.handlerListMap.get(targetClass);
-        if (handlerList == null) {
-            return;
-        }
+    private HandlerList[] resolveChain(final Class<? extends Event> eventClass) {
+        final List<HandlerList> chain = new ArrayList<>();
 
-        final RegisteredHandler[] registeredHandlers = handlerList.getBakedRegisteredHandlers();
-
-        for (final RegisteredHandler handler : registeredHandlers) {
-            if (event instanceof final Cancellable cancellable && handler.isIgnoreCancelled() && cancellable.isCancelled()) {
-                continue;
+        Class<?> current = eventClass;
+        while (current != null && current != Event.class && Event.class.isAssignableFrom(current)) {
+            final HandlerList handlerList = this.handlerListMap.get(current.asSubclass(Event.class));
+            if (handlerList != null) {
+                chain.add(handlerList);
             }
-
-            try {
-                handler.invoke(event);
-            } catch (final EventException e) {
-                LOGGER.log(Level.SEVERE, "Error dispatching event %s to handler %s in %s".formatted(event.getEventName(), handler.getMethod().getName(), handler.getListener().getClass().getName()), e);
-            }
-        }
-    }
-
-    /**
-     * Registers the parent-child hierarchy for the given event class.
-     * Walks up from the class to {@link Event} and registers it as a child
-     * of every parent along the way. Also caches its no-arg constructor if available.
-     */
-    private void registerHierarchy(final Class<? extends Event> eventClass) {
-        if (!(Modifier.isAbstract(eventClass.getModifiers())) && !(this.childConstructorMap.containsKey(eventClass))) {
-            try {
-                final Constructor<? extends Event> declaredConstructor = eventClass.getDeclaredConstructor();
-
-                if (!(declaredConstructor.canAccess(null))) {
-                    declaredConstructor.setAccessible(true);
-                }
-
-                this.childConstructorMap.put(eventClass, declaredConstructor);
-            } catch (final NoSuchMethodException e) {
-                LOGGER.warning("Event class %s has no no-arg constructor and cannot be auto-dispatched as a child event".formatted(eventClass.getName()));
-            }
-        }
-
-        Class<?> current = eventClass.getSuperclass();
-        while (current != null && Event.class.isAssignableFrom(current) && current != Event.class) {
-            final Class<? extends Event> parentClass = current.asSubclass(Event.class);
-
-            this.childRegistryMap.computeIfAbsent(parentClass, __ -> ConcurrentHashMap.newKeySet()).add(eventClass);
 
             current = current.getSuperclass();
         }
+
+        return chain.toArray(HandlerList[]::new);
+    }
+
+    /**
+     * Immutable cache entry: the registration generation it was built under and the
+     * resolved, ordered handler chain.
+     */
+    private record CachedDispatch(int generation, HandlerList[] handlerLists) {
     }
 }
