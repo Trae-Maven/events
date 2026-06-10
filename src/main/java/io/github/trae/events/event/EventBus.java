@@ -26,7 +26,7 @@ import java.util.logging.Logger;
  * (for example {@link io.github.trae.events.EventApi}), which submit {@code call} to an
  * executor — keeping {@code call} predictable and allowing completion to be awaited.</p>
  *
- * <h3>Hierarchy dispatch</h3>
+ * <h2>Hierarchy dispatch</h2>
  * <p>When an event is fired, handlers registered for its exact runtime type are invoked first,
  * followed by handlers registered for each supertype up the chain (excluding {@link Event}
  * itself), in priority order within each type. The resolved chain of {@link HandlerList}s for
